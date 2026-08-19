@@ -3,6 +3,11 @@
 The **MatrixRTC Authorization Service** bridges Matrix and LiveKit, handling
 authentication and room creation when needed.
 
+[![Lint](https://github.com/element-hq/lk-jwt-service/actions/workflows/lint.yaml/badge.svg)](https://github.com/element-hq/lk-jwt-service/actions/workflows/lint.yaml)
+[![Test](https://github.com/element-hq/lk-jwt-service/actions/workflows/test.yaml/badge.svg)](https://github.com/element-hq/lk-jwt-service/actions/workflows/test.yaml)
+[![Build and publish Docker image](https://github.com/element-hq/lk-jwt-service/actions/workflows/docker.yaml/badge.svg)](https://github.com/element-hq/lk-jwt-service/actions/workflows/docker.yaml)
+
+
 ## 💡 TL;DR
 
 Matrix user wants to start or join a call?
@@ -94,7 +99,7 @@ Releases are available
 ### 🐳 From Docker Image
 
 ```shell
-docker run -e LIVEKIT_URL="ws://somewhere" -e LIVEKIT_KEY=devkey -e LIVEKIT_SECRET=secret -e LIVEKIT_FULL_ACCESS_HOMESERVERS=example.com -p 8080:8080 ghcr.io/element-hq/lk-jwt-service:0.3.0
+docker run -e LIVEKIT_URL="ws://somewhere" -e LIVEKIT_KEY=devkey -e LIVEKIT_SECRET=secret -e LIVEKIT_FULL_ACCESS_HOMESERVERS=example.com -p 8080:8080 ghcr.io/element-hq/lk-jwt-service:latest
 ```
 
 ### 📦 From Release
@@ -124,20 +129,57 @@ Set environment variables to configure the service:
 | `LIVEKIT_KEY_FILE`                            | File path with `APIkey: secret` format                        | ⚠️ mutually exclusive with <code>LIVEKIT_{KEY&#124;SECRET}</code>    |         |
 | `LIVEKIT_JWT_BIND`                            | Address to bind the server to                                 | ❌ No, ⚠️ mutually exclusive with `LIVEKIT_JWT_PORT` | `:8080` |
 | `LIVEKIT_JWT_PORT`                            | ⚠️ Deprecated Port to bind the server to                      | ❌ No, ⚠️ mutually exclusive with `LIVEKIT_JWT_BIND` |         |
-| `LIVEKIT_FULL_ACCESS_HOMESERVERS`             | Comma-separated list of full-access homeservers (`*` for all) | ❌ No                                                | `*`     |
+| `LIVEKIT_FULL_ACCESS_HOMESERVERS`             | Comma-separated list of full-access homeservers (`*` for all — see security note below) | ✅ Yes                                               |         |
+| `LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS`       | Interval (seconds) at which delegated-leave jobs re-check that a connected participant is still on the SFU. Guards against missed SFU webhooks. Unset/`0` disables the sanity check. | ❌ No                                                | `0` (disabled) |
+| `LIVEKIT_LOG_LEVEL`                           | One of `debug`, `info`, `warn`/`warning`, `error`             | ❌ No                                                | `info` |
+| `LIVEKIT_CS_API_URL_OVERRIDES`                | Comma-separated list of overrides for Client-Server API locations that cannot be inferred using .well-known discovery (e.g. `example.com=matrix-client.example.com`) | ❌ No                                                | |
+| `LIVEKIT_REDIS_URL`                           | Redis connection URL (e.g. `redis://localhost:6379`). When set, service state will be persisted during operation and restored upon service restarts. When unset, the service falls back to an in-memory store. | ❌ No | |
 
-> [!IMPORTANT]
-> By default, the LiveKit SFU auto-creates rooms for all users. To ensure proper
-> access control, update your LiveKit
-> [config.yaml](https://github.com/livekit/livekit/blob/7350e9933107ecdea4ada8f8bcb0d6ca78b3f8f7/config-sample.yaml#L170)
-> to **disable automatic room creation**.
+> [!WARNING]
+> **Restricting room creation** requires two pieces working together:
+>
+> 1. `LIVEKIT_FULL_ACCESS_HOMESERVERS` is matched against the requesting
+>    user's Matrix server name (origin). Listed origins may trigger
+>    LiveKit room creation on your SFU. `*` grants this to *any* user
+>    whose homeserver can reach this service; list the Matrix server
+>    name(s) of the homeserver(s) you intend to serve.
+> 2. LiveKit SFU [config.yaml](https://github.com/livekit/livekit/blob/7350e9933107ecdea4ada8f8bcb0d6ca78b3f8f7/config-sample.yaml#L170)
+>    must **disable auto-create**, otherwise LiveKit SFU will create rooms
+>    for any user regardless of what this service decides:
+>    ```yaml
+>    room:
+>      auto_create: false
+>    ```
 
-**LiveKit SFU config should include:**
+## 🔌 LiveKit SFU Wiring (Webhooks)
+
+Delegated MatrixRTC leave handling
+([MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140))
+relies on participant lifecycle events from the SFU. Point the LiveKit
+SFU's webhook receiver at this service's `/sfu_webhook` endpoint in its
+[config.yaml](https://github.com/livekit/livekit/blob/master/config-sample.yaml):
 
 ```yaml
-room:
-  auto_create: false
+webhook:
+  api_key: devkey   # must match LIVEKIT_KEY used by this service —
+                    # the SFU signs webhooks with it, this service verifies
+  urls:
+    - https://matrix-rtc.domain.tld/livekit/jwt/sfu_webhook
 ```
+
+> [!NOTE]
+> - The URL is the public, reverse-proxied path to this service (see the
+>   TLS/reverse-proxy section below). For a local dev stack this is
+>   typically `https://matrix-rtc.m.localhost/livekit/jwt/sfu_webhook`.
+> - `webhook.api_key` **must** be one of the API keys the SFU knows
+>   (configured under `keys:` in the SFU config) and **must** match the
+>   `LIVEKIT_KEY` this service is started with. Webhook payloads are
+>   signed by the SFU and verified here.
+> - Without this wiring, `/get_token`, `/sfu/get` and
+>   `/delegate_delayed_leave` the service cannot observe participant
+>   disconnects and therefore cannot send the delegated leave event. The
+>   `LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS` pull-based fallback partially
+>   mitigates this.
 
 ## 🔒 Transport Layer Security (TLS) Setup Using a Reverse Proxy
 
@@ -259,4 +301,13 @@ LIVEKIT_SECRET=secret \
 LIVEKIT_JWT_PORT=6080 \
 LIVEKIT_FULL_ACCESS_HOMESERVERS=synapse.m.localhost \
 ./lk-jwt-service
+```
+
+#### Develop inside container (docker, podman)
+
+```sh
+docker run --rm -it -w /proj -v .:/proj docker.io/golang:${GO_VERSION:-1}-alpine sh
+go build -o lk-jwt-service
+# For healthcheck run following:
+go build -o lk-jwt-service-healthcheck ./healthcheck
 ```
