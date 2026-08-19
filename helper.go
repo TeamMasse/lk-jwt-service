@@ -26,7 +26,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,12 +150,25 @@ var exchangeOpenIdUserInfo = func(
 	client := fclient.NewClient(fclient.WithWellKnownSRVLookups(true), fclient.WithSkipVerify(skipVerifyTLS))
 
 	// validate the openid token by getting the user's ID
+	hostOverride := os.Getenv("USER_INFO_HOST_OVERRIDE")
+	serverName := spec.ServerName(token.MatrixServerName)
+	if hostOverride != "" {
+		serverName = spec.ServerName(hostOverride)
+	}
 	userinfo, err := client.LookupUserInfo(
-		ctx, spec.ServerName(token.MatrixServerName), token.AccessToken,
+		ctx, serverName, token.AccessToken,
 	)
 	if err != nil {
-		slog.Error("OpenIDUserInfo: Failed to look up user info", "err", err)
-		return nil, fmt.Errorf("failed to look up user info: %w", err)
+		// If a host override was provided we may get a userID vs server name
+		// mismatch error from the client. In that specific case, allow the
+		// lookup to proceed (log a warning) so that deployments which use
+		// `USER_INFO_HOST_OVERRIDE` can still validate the token.
+		if hostOverride != "" && strings.Contains(err.Error(), "userID doesn't match server name") {
+			slog.Warn("Ignoring userID/server name mismatch due to USER_INFO_HOST_OVERRIDE", "error", err)
+		} else {
+			slog.Warn("Failed to look up user info", "error", err)
+			return nil, errors.New("failed to look up user info")
+		}
 	}
 	return &userinfo, nil
 }
